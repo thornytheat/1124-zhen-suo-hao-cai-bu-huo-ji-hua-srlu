@@ -69,6 +69,36 @@ def test_forecasts_and_reorder_buffers_align_with_only_closed_clinic_sessions():
             assert model['forecast_total'] is None or interval.get('cycle_buffer') is None
 
 
+def test_safety_stock_requires_enough_complete_weekly_replay_weeks():
+    from clinicstock.pipeline import MINIMUM_VERIFICATION_WEEKS
+    batch=completed_case(48)
+    replay={(row['store'],row['sku']):row
+            for row in batch['reconciliation']['weekly_safety_replay']['records']}
+    for stage in batch['stages'][4]['records']:
+        evidence=replay.get((stage['store'],stage['sku']))
+        complete_weeks=0 if evidence is None else evidence['complete_weeks']
+        # 含断供日的周被剔除，不能用来凑核量周数。
+        if evidence is not None:
+            assert evidence['complete_weeks']+evidence['excluded_outage_weeks']==evidence['replayed_weeks']
+        if stage['validated']:
+            assert complete_weeks>=MINIMUM_VERIFICATION_WEEKS
+        else:
+            # 未核量品项不得带安全库存；一般耗材不采购，关键耗材只允许应急整箱。
+            assert stage['buffer']==0
+            if stage['critical']:
+                assert stage['allocated_cases']==stage['emergency_cases']
+            else:
+                assert stage['allocated_cases']==0
+
+
+def test_emergency_metric_counts_only_unvalidated_critical_lines():
+    batch=completed_case(48)
+    lines=batch['stages'][4]['records']
+    expected=sum(row['emergency_cases'] for row in lines)
+    assert batch['metrics']['应急整箱建议']==expected
+    assert all(row['emergency_cases']==0 for row in lines if row['validated'] or not row['critical'])
+
+
 def test_independent_inventory_runs_share_data_but_never_reuse_budget_allocations():
     low=completed_case(1)
     high=completed_case(100)

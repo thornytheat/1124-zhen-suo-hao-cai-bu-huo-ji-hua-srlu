@@ -1,30 +1,56 @@
 from dataclasses import dataclass
 from math import gcd
 
-from .algorithm import calculate, demand_inventory
+from .algorithm import (
+    calculate,
+    demand_inventory,
+    forecast_gap_units,
+)
 from .contracts import parse
 
 
 @dataclass(frozen=True,slots=True)
 class Portfolio:
-    critical: int = 0
-    accessible: int = 0
+    # 三层覆盖（件）：关键耗材预计缺口、一般耗材预计缺口、经验证的安全库存。
+    critical_gap: int = 0
+    standard_gap: int = 0
+    buffer_units: int = 0
     picks: tuple = ()
 
     @property
     def value(self):
-        return 3*self.critical+self.accessible
+        # 低层级覆盖字典序优先：预算不足时先补关键缺口，再补一般缺口，最后补安全库存。
+        return (self.critical_gap, self.standard_gap, self.buffer_units)
 
     def attach(self, row, cases, unmet):
-        covered=min(unmet,cases*row.pack) if unmet is not None else 0
-        stamp=(row.sku,row.store,cases)
-        return Portfolio(self.critical+(covered if row.critical else 0),
-                         self.accessible+(0 if row.critical else covered),
-                         self.picks+(stamp,) if cases else self.picks)
+        delivered = cases * row.pack
+        if unmet is None:
+            return self
+        if not row.validated:
+            # 未核量品项只允许关键耗材的应急整箱，全部计入其预计缺口层。
+            covered = min(unmet, delivered)
+            critical = covered if row.critical else 0
+            standard = 0 if row.critical else covered
+            if cases == 0:
+                return Portfolio(self.critical_gap, self.standard_gap, self.buffer_units, self.picks)
+            return Portfolio(self.critical_gap + critical,
+                             self.standard_gap + standard,
+                             self.buffer_units,
+                             self.picks + ((row.sku, row.store, cases),))
+        gap = forecast_gap_units(row)
+        gap_cover = min(gap, delivered)
+        # 整箱取整带来的超盖与已验证安全库存同属最后预算层。
+        buffer_cover = max(0, delivered - gap_cover)
+        critical = gap_cover if row.critical else 0
+        standard = 0 if row.critical else gap_cover
+        return Portfolio(self.critical_gap + critical,
+                         self.standard_gap + standard,
+                         self.buffer_units + buffer_cover,
+                         self.picks + ((row.sku, row.store, cases),))
 
 
 def preference(allocation, spend):
-    return allocation.value, allocation.critical, -spend, -len(allocation.picks)
+    return allocation.value, -spend, -len(allocation.picks)
 
 
 def improves(left,spend,right):
@@ -92,7 +118,7 @@ def baseline_metrics(source, money):
     return scores,spent
 
 
-def describe_plan(selected, spent, money, scale, method, baseline, baseline_spent, row_states):
+def describe_plan(selected, spent, money, scale, method, baseline, baseline_spend, row_states):
     inventory={(row.sku,row.store):(row,maximum,unmet,reason) for row,maximum,unmet,reason in row_states}
     resolved=[]
     for sku, store, count in selected.picks:
@@ -101,9 +127,12 @@ def describe_plan(selected, spent, money, scale, method, baseline, baseline_spen
                          'maximum_cases':maximum,'usable_coverage':min(unmet,count*stock.pack),
                          'cost_cents':count*stock.case_cost,'unfilled_units':max(0,unmet-count*stock.pack)})
     return {'method':method,'budget_cents':money,'spent_cents':spent,'remaining_cents':money-spent,'step_cents':scale,
-            'critical_units':selected.critical,'standard_units':selected.accessible,'weighted_coverage':selected.value,
-            'baseline_weighted_coverage':baseline.value,'baseline_spend_cents':baseline_spent,
-            'added_coverage':selected.value-baseline.value,'lines':resolved,
+            'critical_gap_units':selected.critical_gap,'standard_gap_units':selected.standard_gap,
+            'buffer_units':selected.buffer_units,
+            'critical_units':selected.critical_gap,'standard_units':selected.standard_gap,
+            'weighted_coverage':sum(selected.value),
+            'baseline_weighted_coverage':sum(baseline.value),'baseline_spend_cents':baseline_spend,
+            'added_coverage':sum(selected.value)-sum(baseline.value),'lines':resolved,
             'verified_cost':sum(row['cost_cents'] for row in resolved)==spent}
 
 
@@ -112,9 +141,9 @@ def optimize_cartons(records, *, money, maximum_states=8500):
         raise ValueError('INVALID_PORTFOLIO_CONSTRAINTS')
     source=[parse(row) for row in records]
     working=available_choices(source)
-    baseline,baseline_spent=baseline_metrics(source,money)
+    baseline,baseline_spend=baseline_metrics(source,money)
     candidates,scale=exact_cost_envelope(working,money,maximum_states)
     if candidates is None:
-        return describe_plan(baseline,baseline_spent,money,scale,'GREEDY_BUDGET_BOUND',baseline,baseline_spent,working)
+        return describe_plan(baseline,baseline_spend,money,scale,'GREEDY_BUDGET_BOUND',baseline,baseline_spend,working)
     high_budget,chosen=max(candidates.items(),key=lambda item:preference(item[1],item[0]))
-    return describe_plan(chosen,high_budget*scale,money,scale,'BOUNDED_INTEGER_OPTIMUM',baseline,baseline_spent,working)
+    return describe_plan(chosen,high_budget*scale,money,scale,'BOUNDED_INTEGER_OPTIMUM',baseline,baseline_spend,working)

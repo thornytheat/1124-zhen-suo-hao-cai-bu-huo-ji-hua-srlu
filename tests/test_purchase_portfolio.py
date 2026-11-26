@@ -22,7 +22,9 @@ def test_exact_option_beats_marginal_greedy_with_two_smaller_packs():
     assert chosen['spent_cents']==10 and chosen['remaining_cents']==0
     assert chosen['added_coverage']==2
     assert chosen['verified_cost']
-    assert {line['sku'] for line in chosen['lines']}=={'A','C'}
+    picked={line['sku'] for line in chosen['lines'] if line['cases']>0}
+    assert picked=={'A','C'}
+    assert {line['sku'] for line in chosen['lines']}=={'A','B','C','D'}
 
 
 @pytest.mark.parametrize('money', [0,5,11,30,50,100])
@@ -31,13 +33,22 @@ def test_exact_market_compares_against_exhaustive_reference(money):
     b=supplies('B',pack=5,case_cost=5,forecast=6,cold_capacity=10,critical=True)
     c=supplies('C',pack=12,case_cost=11,forecast=16,cold_capacity=24)
     source=[a,b,c]
+    def tier_score(row, units):
+        # 规则5：先补关键耗材预计缺口，再补一般缺口，最后才是经验证的安全库存。
+        gap=min(row['forecast'], row['pack']*units)
+        buffer_units=max(0, row['pack']*units-row['forecast'])
+        critical_gap=gap if row['critical'] else 0
+        standard_gap=0 if row['critical'] else gap
+        return critical_gap, standard_gap, buffer_units
     def reference(counts):
         spend=sum(row['case_cost']*units for row,units in zip(source,counts))
-        score=sum(min(row['forecast'],row['pack']*units)*(3 if row['critical'] else 1) for row,units in zip(source,counts))
+        score=tuple(sum(part) for part in zip(*(tier_score(row,units) for row,units in zip(source,counts))))
         return spend,score
-    expected=max(score for spend,score in map(reference,product(range(3),repeat=3)) if spend<=money)
+    feasible=[map_score for spend,map_score in map(reference,product(range(3),repeat=3)) if spend<=money]
+    expected=max(feasible)
     actual=optimize_cartons(source,money=money)
-    assert actual['weighted_coverage']==expected
+    assert (actual['critical_gap_units'],actual['standard_gap_units'],actual['buffer_units'])==expected
+    assert actual['weighted_coverage']==sum(expected)
     assert actual['spent_cents']+actual['remaining_cents']==money
     assert actual['verified_cost'] and actual['added_coverage']>=0
     assert all(row['cases']<=row['maximum_cases'] and row['unfilled_units']>=0 for row in actual['lines'])
